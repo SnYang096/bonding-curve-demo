@@ -1,0 +1,15 @@
+/* .bonding_curve_chart{
+   display: flex; 
+   justify-content: space-between;
+  width: 100%; 
+
+}
+
+.bonding_curve_line_chart{
+  width: 900px;
+} */
+
+.slider_chart{
+  display: flex;
+  width: 300px;
+}
