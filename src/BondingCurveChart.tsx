@@ -1,180 +1,221 @@
-import React, { useState, useMemo } from "react";
-import { InputNumber, Radio, Switch, Button } from "antd";
-import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer } from "recharts";
+// 可控前70% 平滑的 bonding curve
+import React, { useMemo, useState } from "react";
+import { Line } from "react-chartjs-2";
+import {
+  Chart as ChartJS,
+  CategoryScale,
+  LinearScale,
+  PointElement,
+  LineElement,
+  Tooltip,
+  Legend,
+} from "chart.js";
 
-// === 配置参数 ===
-const TOTAL_SUPPLY = 7_900_000_000; // token 总量
-const PHASE1_THRESHOLD = 69;        // Phase1 阈值%
-const avgPhase1 = 0.00000001;      // Phase1 均价
+ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Tooltip, Legend);
 
-// Phase2 多段阈值和均价
-const phase2Thresholds = [70, 80, 90, 100];
-const phase2AvgPrices = [
-  0.000000077, // 70%
-  0.000000125, // 80%
-  0.000000175, // 90%
-  0.000000233, // 100%
-];
+// ====== 可调参数 ======
+const TOTAL_SUPPLY = 7_000_000_000; // 7B
+const P0 = 1e-8;                    // 底价
+const B = 0.7;                      // 拐点（70%）
 
-// 格式化数字
-const formatNumber = (v: number, decimals = 12) => v.toFixed(decimals).replace(/\.?0+$/, "");
-
-// === 核心函数 ===
-// 计算指数 r
-const calcR = (Pa: number, Pb: number, start: number, end: number) =>
-  Math.pow(Pb / Pa, 1 / (end - start));
-
-// 单价函数
-function priceAt(x: number, smoothPhase1: boolean) {
-  if (x <= PHASE1_THRESHOLD) return smoothPhase1 ? avgPhase1 * Math.pow(calcR(avgPhase1, phase2AvgPrices[0], 0, PHASE1_THRESHOLD), x) : avgPhase1;
-
-  // Phase2 多段指数
-  let prevThreshold = PHASE1_THRESHOLD;
-  let prevPrice = avgPhase1;
-  for (let i = 0; i < phase2Thresholds.length; i++) {
-    const t = phase2Thresholds[i];
-    const p = phase2AvgPrices[i];
-    if (x <= t) {
-      const r = calcR(prevPrice, p, prevThreshold, t);
-      return prevPrice * Math.pow(r, x - prevThreshold);
-    }
-    prevThreshold = t;
-    prevPrice = p;
-  }
-  return phase2AvgPrices[phase2AvgPrices.length - 1];
+// logistic 平滑
+function logistic(t: number) {
+  return 1 / (1 + Math.exp(-t));
 }
 
-// 分段积分公式优化
-function analyticIntegral(x1: number, x2: number, smoothPhase1: boolean) {
-  let total = 0;
-  if (x2 < x1) [x1, x2] = [x2, x1];
-
-  // Phase1
-  if (x1 < PHASE1_THRESHOLD && x2 > 0) {
-    const xa = Math.max(x1, 0), xb = Math.min(x2, PHASE1_THRESHOLD);
-    if (smoothPhase1) {
-      const r1 = calcR(avgPhase1, phase2AvgPrices[0], 0, PHASE1_THRESHOLD);
-      const A = avgPhase1 * Math.pow(r1, -xa);
-      total += (A / Math.log(r1)) * (Math.pow(r1, xb) - Math.pow(r1, xa));
-    } else {
-      total += (xb - xa) * avgPhase1;
-    }
-  }
-
-  // Phase2 多段积分
-  let prevThreshold = PHASE1_THRESHOLD;
-  let prevPrice = avgPhase1;
-  for (let i = 0; i < phase2Thresholds.length; i++) {
-    const t = phase2Thresholds[i];
-    const p = phase2AvgPrices[i];
-    if (x2 <= prevThreshold) break; // 已超范围
-    const xa = Math.max(x1, prevThreshold);
-    const xb = Math.min(x2, t);
-    if (xb > xa) {
-      const r = calcR(prevPrice, p, prevThreshold, t);
-      const A = prevPrice * Math.pow(r, -prevThreshold);
-      total += (A / Math.log(r)) * (Math.pow(r, xb) - Math.pow(r, xa));
-    }
-    prevThreshold = t;
-    prevPrice = p;
-  }
-
-  return total;
+// 单点价格
+function priceAtPercent(
+  x: number,
+  a: number,
+  cLeft: number,
+  cRight: number,
+  w: number
+) {
+  const t = (x - B) / Math.max(w, 1e-9);
+  const blend = logistic(t);
+  const c = cLeft + (cRight - cLeft) * blend;
+  const dx = x - B;
+  return P0 + a * (dx / Math.sqrt(c + dx * dx) + 1);
 }
 
-// 根据 SOL 数量反推可买 token
-function buyTokenBySol(currentSupply: number, solAmount: number, smoothPhase1: boolean) {
-  let low = 0, high = TOTAL_SUPPLY - currentSupply, mid = 0;
-  for (let i = 0; i < 50; i++) {
-    mid = (low + high) / 2;
-    const cost = analyticIntegral((currentSupply / TOTAL_SUPPLY) * 100, ((currentSupply + mid) / TOTAL_SUPPLY) * 100, smoothPhase1);
-    if (cost > solAmount) high = mid;
-    else low = mid;
+// 数值积分（买/卖用）
+function integratePrice(
+  from: number,   // 区间起点（占总供应比例，0~1）
+  to: number,     // 区间终点（占总供应比例，0~1）
+  steps: number,  // 数值积分的步数，用多少个小区间近似积分
+  a: number,      // 曲线振幅（priceAtPercent 中控制价格抬升幅度）
+  cLeft: number,  // 拐点前平滑度（0~1，越大越平滑）
+  cRight: number, // 拐点后平滑度（0~1，越小越陡）
+  w: number       // 拐点过渡宽度（0~1，越小过渡越陡）
+) {
+  let sum = 0;
+  const dx = (to - from) / steps;
+  for (let i = 0; i < steps; i++) {
+    const x = from + dx * (i + 0.5);
+    sum += priceAtPercent(x, a, cLeft, cRight, w) * dx;
   }
-  return low;
+  return sum * TOTAL_SUPPLY; // 还原到 token 数量
 }
 
-// === React 组件 ===
-const BondingCurve: React.FC = () => {
-  const [smoothPhase1, setSmoothPhase1] = useState(false);
-  const [currentSupply, setCurrentSupply] = useState(0);
-  const [tradeType, setTradeType] = useState<"buy" | "sell">("buy");
-  const [tradeAmount, setTradeAmount] = useState(1000000);
-  const [solInput, setSolInput] = useState<number | null>(null);
-  const [result, setResult] = useState<{ tokens: number; sol: number } | null>(null);
+// 买函数：买 deltaTokens 个 token 花多少 SOL
+function buy(
+  currentSupply: number,
+  deltaTokens: number,
+  a: number,
+  cLeft: number,
+  cRight: number,
+  w: number
+) {
+  const from = currentSupply / TOTAL_SUPPLY;
+  const to = (currentSupply + deltaTokens) / TOTAL_SUPPLY;
+  return integratePrice(from, to, 200, a, cLeft, cRight, w);
+}
 
-  const data = useMemo(() => Array.from({ length: 101 }, (_, i) => ({ x: i, y: priceAt(i, smoothPhase1) })), [smoothPhase1]);
+// 卖函数：卖 deltaTokens 个 token 拿回多少 SOL
+function sell(
+  currentSupply: number,
+  deltaTokens: number,
+  a: number,
+  cLeft: number,
+  cRight: number,
+  w: number
+) {
+  const from = (currentSupply - deltaTokens) / TOTAL_SUPPLY;
+  const to = currentSupply / TOTAL_SUPPLY;
+  return integratePrice(from, to, 200, a, cLeft, cRight, w);
+}
 
-  const handleTrade = () => {
-    const currentProgress = (currentSupply / TOTAL_SUPPLY) * 100;
-    if (tradeType === "buy") {
-      let tokensToBuy = tradeAmount;
-      if (solInput) tokensToBuy = buyTokenBySol(currentSupply, solInput, smoothPhase1);
-      const cost = analyticIntegral(currentProgress, ((currentSupply + tokensToBuy) / TOTAL_SUPPLY) * 100, smoothPhase1);
-      setResult({ tokens: tokensToBuy, sol: cost });
-      setCurrentSupply((s) => s + tokensToBuy);
-    } else {
-      const newSupply = Math.max(0, currentSupply - tradeAmount);
-      const refund = analyticIntegral((newSupply / TOTAL_SUPPLY) * 100, currentProgress, smoothPhase1);
-      setResult({ tokens: tradeAmount, sol: refund });
-      setCurrentSupply(newSupply);
+export default function SmoothBefore70Chart() {
+  const [a, setA] = useState(1e-8);
+  const [cLeft, setCLeft] = useState(0.2);
+  const [cRight, setCRight] = useState(0.01);
+  const [w, setW] = useState(0.03);
+  const [cursorPercent, setCursorPercent] = useState(0.7);
+
+  // 买卖输入
+  const [buyAmount, setBuyAmount] = useState(1_000_000);  // 默认买100万
+  const [sellAmount, setSellAmount] = useState(1_000_000); // 默认卖100万
+
+  const { chartData, currentInfo, totalRaised, buyCost, sellReturn } = useMemo(() => {
+    const labels: string[] = [];
+    const prices: number[] = [];
+    const step = 0.01;
+    for (let i = 0; i <= 100; i++) {
+      const x = i * step;
+      labels.push(`${i}%`);
+      prices.push(priceAtPercent(x, a, cLeft, cRight, w));
     }
-  };
+
+    const chartData = {
+      labels,
+      datasets: [
+        {
+          label: "Token 价格 (SOL)",
+          data: prices,
+          borderColor: "rgb(99,102,241)",
+          backgroundColor: "rgba(99,102,241,0.1)",
+          borderWidth: 2,
+          pointRadius: 0,
+          tension: 0.2,
+        },
+      ],
+    };
+
+    // 当前进度
+    const x = Math.min(1, Math.max(0, cursorPercent));
+    const price = priceAtPercent(x, a, cLeft, cRight, w);
+    const sold = Math.round(TOTAL_SUPPLY * x);
+
+    // 买卖计算
+    const buyCost = buy(sold, buyAmount, a, cLeft, cRight, w);
+    const sellReturn = sell(sold, sellAmount, a, cLeft, cRight, w);
+
+    // 累积募集（卖完）
+    const totalRaised = integratePrice(0, 1, 200, a, cLeft, cRight, w);
+
+    return {
+      chartData,
+      currentInfo: { x, sold, price },
+      totalRaised,
+      buyCost,
+      sellReturn,
+    };
+  }, [a, cLeft, cRight, w, cursorPercent, buyAmount, sellAmount]);
 
   return (
-    <div style={{ padding: 20 }}>
-      <h2>Bonding Curve 模拟 (Phase1: 0-{PHASE1_THRESHOLD}%, Phase2: 70-100%)</h2>
+    <div style={{ maxWidth: 960, margin: "0 auto", padding: 16 }}>
+      <h2>Bonding Curve 买卖模拟</h2>
 
-      <div style={{ marginBottom: 16 }}>
-        <span>Phase1 平缓增长: </span>
-        <Switch checked={smoothPhase1} onChange={setSmoothPhase1} />
+      {/* 参数调节 */}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(2,1fr)", gap: 16 }}>
+        <label>
+          a（幅度）
+          <input type="number" step="1e-10" value={a} onChange={(e) => setA(Number(e.target.value))} />
+        </label>
+        <label>
+          c_left（70% 前平滑度）
+          <input type="number" step="0.01" value={cLeft} onChange={(e) => setCLeft(Number(e.target.value))} />
+        </label>
+        <label>
+          c_right（70% 后平滑度）
+          <input type="number" step="0.001" value={cRight} onChange={(e) => setCRight(Number(e.target.value))} />
+        </label>
+        <label>
+          过渡宽度 w
+          <input type="number" step="0.005" value={w} onChange={(e) => setW(Number(e.target.value))} />
+        </label>
+        <label>
+          观测位置（0~1）
+          <input type="number" step="0.01" min="0" max="1" value={cursorPercent} onChange={(e) => setCursorPercent(Number(e.target.value))} />
+        </label>
       </div>
 
-      <ResponsiveContainer width="100%" height={300}>
-        <LineChart data={data}>
-          <XAxis dataKey="x" label={{ value: "Progress %", position: "insideBottomRight", offset: -5 }} />
-          <YAxis scale="log" domain={["auto","auto"]} tickFormatter={(v) => formatNumber(Number(v),12)} />
-          <Tooltip formatter={(v:any) => formatNumber(Number(v),12)+" SOL"} />
-          <Line type="monotone" dataKey="y" stroke="#00f0ff" dot={false} strokeWidth={2} />
-        </LineChart>
-      </ResponsiveContainer>
+      {/* 图表 */}
+      <Line data={chartData} options={{
+        responsive: true,
+        interaction: { mode: "index", intersect: false },
+        scales: {
+          x: { title: { display: true, text: "销售进度 (%)" } },
+          y: { 
+            title: { display: true, text: "价格 (SOL)" }, 
+            ticks: { 
+              callback: function(tickValue: string | number) {
+                if (typeof tickValue === "number") {
+                  return tickValue.toFixed(9);
+                }
+                return tickValue;
+              }
+            } 
+          }
+        },
+        plugins: { legend: { display: true } },
+      }} />
 
-      <div style={{ marginTop:20 }}>
-        <div style={{ marginBottom:12 }}>
-          <span>当前流通: {currentSupply.toLocaleString()} / {TOTAL_SUPPLY.toLocaleString()} token</span>
-        </div>
-
-        <Radio.Group value={tradeType} onChange={(e)=>setTradeType(e.target.value)} style={{ marginBottom:12 }}>
-          <Radio.Button value="buy">买入</Radio.Button>
-          <Radio.Button value="sell">卖出</Radio.Button>
-        </Radio.Group>
-
-        {tradeType==="buy" && (
-          <div style={{ marginBottom:12 }}>
-            <span style={{ marginRight:8 }}>SOL 数量 (可选):</span>
-            <InputNumber value={solInput||undefined} onChange={(v)=>setSolInput(v||null)} min={0} step={0.000000001}/>
-          </div>
-        )}
-
-        <div style={{ marginBottom:12 }}>
-          <span style={{ marginRight:8 }}>Token 数量:</span>
-          <InputNumber value={tradeAmount} onChange={(v)=>setTradeAmount(v||0)} min={1} step={1000}/>
-        </div>
-
-        <Button type="primary" onClick={handleTrade}>执行 {tradeType==="buy"?"买入":"卖出"}</Button>
-
-        {result && (
-          <div style={{ marginTop:16 }}>
-            <p>
-              {tradeType==="buy"
-                ? `买入 ${result.tokens.toLocaleString()} token，花费约 ${formatNumber(result.sol)} SOL`
-                : `卖出 ${result.tokens.toLocaleString()} token，获得约 ${formatNumber(result.sol)} SOL`}
-            </p>
-          </div>
-        )}
+      {/* 当前状态 */}
+      <div style={{ marginTop: 16 }}>
+        <div>当前位置：<b>{(currentInfo.x * 100).toFixed(2)}%</b></div>
+        <div>已售 Token：<b>{currentInfo.sold.toLocaleString()}</b></div>
+        <div>当前价格：<b>{currentInfo.price.toFixed(9)} SOL</b></div>
       </div>
+
+      {/* 买卖输入 */}
+      <div style={{ marginTop: 24 }}>
+        <h3>买卖模拟</h3>
+        <label>
+          买入数量（Token）
+          <input type="number" step="1000" value={buyAmount} onChange={(e) => setBuyAmount(Number(e.target.value))} />
+        </label>
+        <div>需要支付：<b>{buyCost.toFixed(6)} SOL</b></div>
+
+        <label style={{ marginTop: 12, display: "block" }}>
+          卖出数量（Token）
+          <input type="number" step="1000" value={sellAmount} onChange={(e) => setSellAmount(Number(e.target.value))} />
+        </label>
+        <div>可获得：<b>{sellReturn.toFixed(6)} SOL</b></div>
+      </div>
+
+      <hr style={{ margin: "16px 0", opacity: 0.3 }} />
+      <div>卖完（100%）累计募集：<b>{totalRaised.toFixed(6)} SOL</b></div>
     </div>
   );
-};
-
-export default BondingCurve;
+}
