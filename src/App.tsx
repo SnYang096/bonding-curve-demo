@@ -1,4 +1,3 @@
-import React from "react";
 import BondingCurveChart from "./BondingCurveChart";
 
 function App() {
